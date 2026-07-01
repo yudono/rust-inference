@@ -273,14 +273,15 @@ cargo run --release -- \
   --temperature 0.0
 ```
 
-**Qwen2 specs (7B):**
-- Embed dim: 3584
-- Layers: 28
-- Heads: 28
-- KV heads: 4 (GQA)
-- Hidden dim: 18944
-- Rope base: 1000000.0
-- Vocab size: 151936
+**Qwen2 specs:**
+
+| Model | Embed Dim | Layers | Heads | KV Heads | Hidden Dim |
+|-------|-----------|--------|-------|----------|------------|
+| 0.5B | 896 | 24 | 14 | 2 | 4864 |
+| 1.5B | 1536 | 28 | 12 | 2 | 8960 |
+| 7B | 3584 | 28 | 28 | 4 | 18944 |
+
+Common: RoPE base=`1000000.0`, Vocab size=`151936`, Norm eps=`1e-6`, Head dim=`64`
 
 ---
 
@@ -681,6 +682,27 @@ For each token in recent window:
 - **Cache**: Pre-allocated KV cache, no allocation during generation
 - **I/O**: Single file read, sequential tensor loading
 
+### Verified Accuracy
+
+| Prompt | Logit Correlation | Model |
+|--------|------------------|-------|
+| "The" | 0.9956 | Qwen2-0.5B Q4_K_M |
+
+Logits compared against `llama_cpp` Python reference. Top-1 tokens match after Q5_0 dequant fix. Minor differences (~0.5%) from FP precision in dequantization.
+
+### Quantization Support
+
+| Type | Status | Note |
+|------|--------|------|
+| F32 | Supported | No dequant needed |
+| F16 | Supported | Verified |
+| Q8_0 | Supported | Verified |
+| Q4_0 | Supported | Verified |
+| Q5_0 | Supported | **Fixed** — non-interleaved nibble order matches GGML master |
+| Q4_K | Supported | Verified |
+| Q5_K | Supported | Verified |
+| Q6_K | Supported | Verified |
+
 ## Limitations
 
 - No SIMD intrinsics (relies on compiler auto-vectorization)
@@ -689,6 +711,8 @@ For each token in recent window:
 - No flash attention
 - Quantized weights dequantized to f32 (higher memory usage)
 - Sliding window attention not implemented (Mistral)
+- Qwen2 does not use BOS token (despite GGUF metadata having it)
+- `output.weight` is optional; when missing, `token_embd.weight` is used as tied lm_head
 
 ## Dependencies
 

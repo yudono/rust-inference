@@ -32,6 +32,7 @@ mod tokenizer;
 mod transformer;
 
 use std::env;
+use std::io::{self, Write, BufRead};
 use std::path::PathBuf;
 
 use model::Model;
@@ -43,10 +44,11 @@ use sampler::SamplerConfig;
 
 struct Args {
     model_path: PathBuf,
-    prompt: String,
+    prompt: Option<String>,
     max_tokens: usize,
     sampler_config: SamplerConfig,
     max_seq_len: Option<usize>,
+    interactive: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +61,7 @@ fn parse_args() -> Result<Args, String> {
     let mut top_p = 0.95f32;
     let mut seed = 12345u64;
     let mut max_seq_len: Option<usize> = None;
+    let mut interactive = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -128,6 +131,9 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("Invalid --max-seq-len: {}", e))?,
                 );
             }
+            "--interactive" | "-i" => {
+                interactive = true;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -142,7 +148,6 @@ fn parse_args() -> Result<Args, String> {
     }
 
     let model_path = model_path.ok_or("--model is required")?;
-    let prompt = prompt.ok_or("--prompt is required")?;
 
     if !model_path.exists() {
         return Err(format!("Model file not found: {}", model_path.display()));
@@ -161,6 +166,7 @@ fn parse_args() -> Result<Args, String> {
             seed,
         },
         max_seq_len,
+        interactive,
     })
 }
 
@@ -168,10 +174,12 @@ fn print_usage() {
     eprintln!("GGUF Rust Inference Engine");
     eprintln!();
     eprintln!("Usage: gguf-infer --model <model.gguf> --prompt \"<text>\" [options]");
+    eprintln!("       gguf-infer --model <model.gguf> --interactive");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --model, -m        Path to GGUF model file (required)");
-    eprintln!("  --prompt, -p       Input text prompt (required)");
+    eprintln!("  --prompt, -p       Input text prompt (for single inference)");
+    eprintln!("  --interactive, -i  Interactive mode (like Ollama)");
     eprintln!("  --max-tokens, -n   Maximum tokens to generate (default: 512)");
     eprintln!("  --temperature, -t  Sampling temperature (default: 0.8)");
     eprintln!("  --top-k, -k        Top-K sampling (default: 40)");
@@ -209,18 +217,47 @@ fn main() {
         }
     };
 
-    // Generate text
-    eprintln!("Generating with config:");
-    eprintln!("  Temperature: {}", args.sampler_config.temperature);
-    eprintln!("  Top-K:       {}", args.sampler_config.top_k);
-    eprintln!("  Top-P:       {}", args.sampler_config.top_p);
-    eprintln!("  Max tokens:  {}", args.max_tokens);
-    eprintln!();
-
-    let output = model.generate(&args.prompt, args.max_tokens, args.sampler_config);
-
-    // Print output
-    eprintln!("---");
-    print!("{}", args.prompt);
-    println!("{}", output);
+    if args.interactive {
+        // Interactive mode
+        eprintln!("Interactive mode (type 'exit' to quit)\n");
+        
+        let stdin = io::stdin();
+        loop {
+            eprint!(">>> ");
+            io::stderr().flush().ok();
+            
+            let mut input = String::new();
+            match stdin.lock().read_line(&mut input) {
+                Ok(_) => {
+                    let input = input.trim();
+                    if input == "exit" || input == "quit" {
+                        break;
+                    }
+                    if input.is_empty() {
+                        continue;
+                    }
+                    
+                    // Generate response
+                    eprintln!();
+                    let _ = model.generate(input, args.max_tokens, args.sampler_config.clone());
+                    eprintln!();
+                }
+                Err(e) => {
+                    eprintln!("Error reading input: {}", e);
+                    break;
+                }
+            }
+        }
+    } else {
+        // Single prompt mode
+        let prompt = match args.prompt {
+            Some(p) => p,
+            None => {
+                eprintln!("Error: --prompt is required (or use --interactive)");
+                std::process::exit(1);
+            }
+        };
+        
+        let _ = model.generate(&prompt, args.max_tokens, args.sampler_config);
+    }
 }

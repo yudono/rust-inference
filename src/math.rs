@@ -181,26 +181,13 @@ pub fn mat_mul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize
     }
 }
 
-/// Matrix-vector multiplication: y = A × x
-/// A: (M, N), x: (N), y: (M)
-pub fn mat_vec_mul(a: &[f32], x: &[f32], y: &mut [f32], m: usize, n: usize) {
-    assert_eq!(a.len(), m * n);
-    assert_eq!(x.len(), n);
-    assert_eq!(y.len(), m);
-
-    for i in 0..m {
-        let mut sum = 0.0f32;
-        let a_row = &a[i * n..(i + 1) * n];
-        for j in 0..n {
-            sum += a_row[j] * x[j];
-        }
-        y[i] = sum;
-    }
-}
-
-/// Matrix-vector multiplication with row offsets for GGUF weight layout
-/// A is stored row-major with rows indexed by output_dim
-/// For attention: computes Q = xW^T for a single token position
+/// Matrix-vector multiply for GGUF weight layout
+/// GGUF stores 2D tensors with dims [ne0, ne1] in column-major order:
+///   data[i0 + ne0 * i1] = element at (i0, i1)
+/// For a weight matrix mapping in_dim -> out_dim:
+///   ne0 = in_dim (fast/inner dimension), ne1 = out_dim (slow/outer dimension)
+///   weight[i_in + in_dim * i_out] = W[i_out, i_in]
+/// This computes: out[i] = Σ_j x[j] * weight[j + in_dim * i]
 pub fn mat_vec_mul_transposed(
     weight: &[f32],
     x: &[f32],
@@ -208,17 +195,36 @@ pub fn mat_vec_mul_transposed(
     out_dim: usize,
     in_dim: usize,
 ) {
-    assert_eq!(weight.len(), out_dim * in_dim);
+    assert_eq!(weight.len(), in_dim * out_dim);
     assert_eq!(x.len(), in_dim);
     assert_eq!(out.len(), out_dim);
 
     for i in 0..out_dim {
         let mut sum = 0.0f32;
-        let w_row = &weight[i * in_dim..(i + 1) * in_dim];
         for j in 0..in_dim {
-            sum += w_row[j] * x[j];
+            sum += weight[j + in_dim * i] * x[j];
         }
         out[i] = sum;
+    }
+}
+
+/// Matrix-vector multiply for standard row-major storage W[out_dim, in_dim]
+pub fn mat_vec_mul(
+    weight: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+) {
+    assert_eq!(weight.len(), out_dim * in_dim);
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(y.len(), out_dim);
+    for i in 0..out_dim {
+        let mut sum = 0.0f32;
+        for j in 0..in_dim {
+            sum += weight[i * in_dim + j] * x[j];
+        }
+        y[i] = sum;
     }
 }
 

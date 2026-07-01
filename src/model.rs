@@ -139,17 +139,7 @@ impl Model {
             config.max_seq_len = max_len;
         }
 
-        eprintln!("\nModel configuration:");
-        eprintln!("  Architecture:  {}", config.architecture);
-        eprintln!("  Embed dim:     {}", config.embed_dim);
-        eprintln!("  Layers:        {}", config.n_layers);
-        eprintln!("  Heads:         {}", config.n_heads);
-        eprintln!("  KV heads:      {}", config.n_kv_heads);
-        eprintln!("  Hidden dim:    {}", config.hidden_dim);
-        eprintln!("  Vocab size:    {}", config.vocab_size);
-        eprintln!("  Max seq len:   {}", config.max_seq_len);
-        eprintln!("  Rope base:     {}", config.rope_base);
-        eprintln!("  Norm eps:      {}", config.norm_eps);
+        eprintln!("Config: {} - {} layers, {} embed", config.architecture, config.n_layers, config.embed_dim);
 
         // --- Load tokenizer ---
         let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
@@ -159,7 +149,6 @@ impl Model {
         let rope = RoPE::new(head_dim, config.rope_base, config.max_seq_len);
 
         // --- Load tensor weights ---
-        eprintln!("\nLoading tensor weights...");
         let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
 
         for tensor_info in &gguf.tensors {
@@ -178,6 +167,10 @@ impl Model {
                 GgufDataType::Q5_K => {
                     let n_blocks = (n_elements + 255) / 256;
                     n_blocks * 176
+                }
+                GgufDataType::Q5_0 => {
+                    let n_blocks = (n_elements + 31) / 32;
+                    n_blocks * 22
                 }
                 GgufDataType::Q6_K => {
                     let n_blocks = (n_elements + 255) / 256;
@@ -207,25 +200,17 @@ impl Model {
                 quant::dequantize(&raw_data, tensor_info.data_type, n_elements)
                     .map_err(|e| format!("Failed to dequantize '{}': {}", tensor_info.name, e))?;
 
-            eprintln!(
-                "  Loaded: {:<50} shape={:?} type={:?} ({:.1} MB)",
-                tensor_info.name,
-                tensor_info.dims,
-                tensor_info.data_type,
-                f32_data.len() as f64 * 4.0 / (1024.0 * 1024.0)
-            );
-
             tensors.insert(tensor_info.name.clone(), f32_data);
         }
 
         // --- Build transformer model ---
-        eprintln!("\nBuilding transformer model...");
         let head_dim = config.embed_dim / config.n_heads;
 
         // Load token embeddings
         let token_embd = tensors
             .remove("token_embd.weight")
             .ok_or("Missing token_embd.weight")?;
+
 
         // Load final norm
         let final_norm_weight = tensors
@@ -235,17 +220,16 @@ impl Model {
 
         // Load LM head (may be tied with token embeddings)
         let lm_head = if let Some(w) = tensors.remove("output.weight") {
+            eprintln!("  Using separate output.weight for lm_head ({} elements)", w.len());
             w
         } else {
-            // Weight tying: lm_head shares weights with token_embd
-            eprintln!("  Using weight tying: lm_head = token_embd");
+            eprintln!("  Using token_embd (tied weights) for lm_head ({} elements)", token_embd.len());
             token_embd.clone()
         };
 
-        // Load transformer layers
+
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            eprintln!("  Loading layer {}...", i);
 
             let norm_w = tensors
                 .remove(&format!("blk.{}.attn_norm.weight", i))
@@ -264,6 +248,15 @@ impl Model {
             let wo = tensors
                 .remove(&format!("blk.{}.attn_output.weight", i))
                 .ok_or_else(|| format!("Missing blk.{}.attn_output.weight", i))?;
+            let bq = tensors
+                .remove(&format!("blk.{}.attn_q.bias", i))
+                .ok_or_else(|| format!("Missing blk.{}.attn_q.bias", i))?;
+            let bk = tensors
+                .remove(&format!("blk.{}.attn_k.bias", i))
+                .ok_or_else(|| format!("Missing blk.{}.attn_k.bias", i))?;
+            let bv = tensors
+                .remove(&format!("blk.{}.attn_v.bias", i))
+                .ok_or_else(|| format!("Missing blk.{}.attn_v.bias", i))?;
 
             let attention = Attention::new(
                 i,
@@ -274,6 +267,9 @@ impl Model {
                 wk,
                 wv,
                 wo,
+                bq,
+                bk,
+                bv,
             );
 
             let ffn_norm_w = tensors
@@ -290,8 +286,43 @@ impl Model {
             let down_proj = tensors
                 .remove(&format!("blk.{}.ffn_down.weight", i))
                 .ok_or_else(|| format!("Missing blk.{}.ffn_down.weight", i))?;
+            
+            // Verify tensor dimensions
+            let expected_gate = config.hidden_dim * config.embed_dim;
+            let expected_down = config.embed_dim * config.hidden_dim;
+            if gate_proj.len() != expected_gate {
+                eprintln!("  WARNING: blk.{}.ffn_gate.weight: expected {} elements, got {}", i, expected_gate, gate_proj.len());
+            }
+            if up_proj.len() != expected_gate {
+                eprintln!("  WARNING: blk.{}.ffn_up.weight: expected {} elements, got {}", i, expected_gate, up_proj.len());
+            }
+            if down_proj.len() != expected_down {
+                eprintln!("  WARNING: blk.{}.ffn_down.weight: expected {} elements, got {}", i, expected_down, down_proj.len());
+            }
+            
+            // Check for NaN/Inf in gate_proj and up_proj for all layers
+            let gate_w = &gate_proj;
+            let has_nan = gate_w.iter().any(|&v| v.is_nan());
+            let has_inf = gate_w.iter().any(|&v| v.is_infinite());
+            if has_nan || has_inf {
+                eprintln!("  ERROR: blk.{}.ffn_gate.weight has NaN or Inf!", i);
+            }
+            let up_w = &up_proj;
+            let has_nan = up_w.iter().any(|&v| v.is_nan());
+            let has_inf = up_w.iter().any(|&v| v.is_infinite());
+            if has_nan || has_inf {
+                eprintln!("  ERROR: blk.{}.ffn_up.weight has NaN or Inf!", i);
+            }
 
             let mlp = Mlp::new(gate_proj, up_proj, down_proj, config.hidden_dim, config.embed_dim);
+
+            if cfg!(debug_assertions) {
+                let w = &mlp.down_proj;
+                let min = w.iter().cloned().fold(f32::MAX, f32::min);
+                let max = w.iter().cloned().fold(f32::MIN, f32::max);
+                let mean = w.iter().sum::<f32>() / w.len() as f32;
+                eprintln!("  blk.{}.ffn_down: min={:+.4} max={:+.4} mean={:+.6}", i, min, max, mean);
+            }
 
             layers.push(TransformerLayer {
                 layer_idx: i,
@@ -312,7 +343,7 @@ impl Model {
             max_seq_len: config.max_seq_len,
         };
 
-        eprintln!("\nModel loaded successfully!\n");
+        eprintln!("Model loaded.\n");
 
         Ok(Model {
             transformer,
@@ -322,13 +353,16 @@ impl Model {
         })
     }
 
-    /// Generate text given a prompt
+    /// Generate text given a prompt, streaming output to stdout with TPS display
     pub fn generate(
         &mut self,
         prompt: &str,
         max_tokens: usize,
         sampler_config: SamplerConfig,
     ) -> String {
+        use std::io::{self, Write};
+        use std::time::Instant;
+
         let mut sampler = Sampler::new(sampler_config);
         let mut kv_caches: Vec<KVCache> = (0..self.config.n_layers)
             .map(|_| {
@@ -337,27 +371,38 @@ impl Model {
             })
             .collect();
 
-        // Encode prompt
+        // Encode prompt (Qwen2 does NOT use BOS token, despite GGUF metadata having it)
         let prompt_ids = self.tokenizer.encode(prompt);
-        eprintln!("Prompt tokens: {:?}", prompt_ids);
-        eprintln!("Prompt: \"{}\"", prompt);
-        eprintln!("---");
 
         let mut all_token_ids: Vec<usize> = Vec::new();
         let mut logits = vec![0.0f32; self.config.vocab_size];
 
         // --- Process prompt tokens (prefill) ---
+        let prefill_start = Instant::now();
         for (pos, &token_id) in prompt_ids.iter().enumerate() {
             self.transformer
                 .forward(token_id, pos, &self.rope, &mut kv_caches, &mut logits);
             all_token_ids.push(token_id);
         }
+        let prefill_time = prefill_start.elapsed();
+        let prefill_tps = prompt_ids.len() as f64 / prefill_time.as_secs_f64();
 
         // --- Generate new tokens ---
         let mut current_pos = prompt_ids.len();
         let mut generated_text = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
+        let mut consumed = 0;
 
-        for step in 0..max_tokens {
+        // Print prompt first
+        eprint!("{}", prompt);
+        io::stderr().flush().ok();
+
+        let mut generated_tokens = 0;
+        let gen_start = Instant::now();
+        let mut last_print = Instant::now();
+        let mut tokens_since_last_print = 0;
+
+        for _step in 0..max_tokens {
             // Sample next token
             let recent = if all_token_ids.len() > 64 {
                 &all_token_ids[all_token_ids.len() - 64..]
@@ -373,9 +418,54 @@ impl Model {
                 }
             }
 
-            // Decode token
-            if let Some(text) = self.tokenizer.id_to_token(next_token) {
-                generated_text.push_str(text);
+            // Decode token to raw bytes and buffer them for UTF-8 streaming
+            let bytes = self.tokenizer.decode_token_bytes(next_token);
+            byte_buf.extend_from_slice(&bytes);
+            // Flush as much valid UTF-8 as possible, replacing invalid bytes
+            loop {
+                if consumed >= byte_buf.len() {
+                    break;
+                }
+                match std::str::from_utf8(&byte_buf[consumed..]) {
+                    Ok(s) => {
+                        if !s.is_empty() {
+                            print!("{}", s);
+                            generated_text.push_str(s);
+                        }
+                        consumed = byte_buf.len();
+                        break;
+                    }
+                    Err(e) => {
+                        let valid_len = e.valid_up_to();
+                        if valid_len > 0 {
+                            if let Ok(s) = std::str::from_utf8(&byte_buf[consumed..consumed + valid_len]) {
+                                print!("{}", s);
+                                generated_text.push_str(s);
+                            }
+                            consumed += valid_len;
+                        }
+                        let error_len = e.error_len().unwrap_or(1);
+                        print!("\u{FFFD}");
+                        generated_text.push('\u{FFFD}');
+                        consumed += error_len;
+                    }
+                }
+            }
+            io::stdout().flush().ok();
+
+            generated_tokens += 1;
+            tokens_since_last_print += 1;
+
+            // Show TPS every 10 tokens
+            if tokens_since_last_print >= 10 {
+                let elapsed = last_print.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let tps = tokens_since_last_print as f64 / elapsed;
+                    eprint!("\r[TPS: {:.1}]", tps);
+                    io::stderr().flush().ok();
+                }
+                tokens_since_last_print = 0;
+                last_print = Instant::now();
             }
 
             // Forward pass for the new token
@@ -391,6 +481,47 @@ impl Model {
             current_pos += 1;
         }
 
+        let gen_time = gen_start.elapsed();
+        
+        // Flush remaining bytes in the buffer
+        while consumed < byte_buf.len() {
+            match std::str::from_utf8(&byte_buf[consumed..]) {
+                Ok(s) => {
+                    if !s.is_empty() {
+                        print!("{}", s);
+                        generated_text.push_str(s);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let valid_len = e.valid_up_to();
+                    if valid_len > 0 {
+                        if let Ok(s) = std::str::from_utf8(&byte_buf[consumed..consumed + valid_len]) {
+                            print!("{}", s);
+                            generated_text.push_str(s);
+                        }
+                        consumed += valid_len;
+                    }
+                    let error_len = e.error_len().unwrap_or(1);
+                    print!("\u{FFFD}");
+                    generated_text.push('\u{FFFD}');
+                    consumed += error_len;
+                }
+            }
+        }
+        io::stdout().flush().ok();
+        
+        let gen_tps = if gen_time.as_secs_f64() > 0.0 {
+            generated_tokens as f64 / gen_time.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        println!();
+        eprintln!("\n--- Generation Stats ---");
+        eprintln!("  Prefill: {} tokens in {:.2}s ({:.1} tok/s)", prompt_ids.len(), prefill_time.as_secs_f64(), prefill_tps);
+        eprintln!("  Generate: {} tokens in {:.2}s ({:.1} tok/s)", generated_tokens, gen_time.as_secs_f64(), gen_tps);
+        
         generated_text
     }
 

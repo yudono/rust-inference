@@ -1,24 +1,3 @@
-// ============================================================================
-// transformer.rs — Transformer Block Stack (Pure Rust)
-// ============================================================================
-//
-// LLaMA Transformer Architecture (per layer):
-//
-//   x_norm = RMSNorm(x)                    // Pre-norm
-//   attn_out = Attention(x_norm)           // Self-attention
-//   x = x + attn_out                       // Residual connection
-//
-//   x_norm = RMSNorm(x)                    // Pre-norm
-//   ffn_out = SwiGLU(x_norm)              // Feed-forward network
-//   x = x + ffn_out                        // Residual connection
-//
-//   [repeat for each layer]
-//
-//   x = RMSNorm(x)                         // Final normalization
-//   logits = x @ W_lm_head^T              // Language model head
-//
-// Note: LLaMA uses pre-norm (RMSNorm before attention/FFN), not post-norm.
-
 use crate::attention::Attention;
 use crate::kv_cache::KVCache;
 use crate::math;
@@ -26,26 +5,16 @@ use crate::mlp::Mlp;
 use crate::rmsnorm::RmsNorm;
 use crate::rope::RoPE;
 
-// ============================================================================
-// Transformer Layer
-// ============================================================================
-
 #[derive(Debug, Clone)]
 pub struct TransformerLayer {
-    /// Layer index
     pub layer_idx: usize,
-    /// Attention norm (RMSNorm)
     pub attention_norm: RmsNorm,
-    /// Self-attention
     pub attention: Attention,
-    /// FFN norm (RMSNorm)
     pub ffn_norm: RmsNorm,
-    /// Feed-forward network (SwiGLU)
     pub mlp: Mlp,
 }
 
 impl TransformerLayer {
-    /// Forward pass for a single token
     pub fn forward(
         &self,
         x: &[f32],
@@ -56,65 +25,38 @@ impl TransformerLayer {
     ) {
         let embed_dim = x.len();
 
-        // --- Attention block ---
-        // x_norm = RMSNorm(x)
         let mut x_norm = vec![0.0f32; embed_dim];
         self.attention_norm.forward(x, &mut x_norm);
 
-        // attn_out = Attention(x_norm)
         let mut attn_out = vec![0.0f32; embed_dim];
         self.attention
             .forward(&x_norm, position, rope, kv_cache, &mut attn_out);
 
-        // x = x + attn_out (residual)
         output.copy_from_slice(x);
         math::vec_add_inplace(output, &attn_out);
 
-        // --- FFN block ---
-        // x_norm = RMSNorm(x)
         let mut x_norm2 = vec![0.0f32; embed_dim];
         self.ffn_norm.forward(output, &mut x_norm2);
 
-        // ffn_out = SwiGLU(x_norm)
         let mut ffn_out = vec![0.0f32; embed_dim];
         self.mlp.forward(&x_norm2, &mut ffn_out);
 
-        // x = x + ffn_out (residual)
         math::vec_add_inplace(output, &ffn_out);
     }
 }
 
-// ============================================================================
-// Full Transformer Model
-// ============================================================================
-
 #[derive(Debug, Clone)]
 pub struct Transformer {
-    /// Vocabulary embedding table: (vocab_size, embed_dim)
     pub token_embd: Vec<f32>,
-    /// Embedding dimension
     pub embed_dim: usize,
-    /// Vocabulary size
     pub vocab_size: usize,
-    /// Transformer layers
     pub layers: Vec<TransformerLayer>,
-    /// Final RMSNorm weight
     pub final_norm: RmsNorm,
-    /// Language model head (output projection): (vocab_size, embed_dim)
     pub lm_head: Vec<f32>,
-    /// Maximum sequence length
     pub max_seq_len: usize,
 }
 
 impl Transformer {
-    /// Forward pass for a single token position.
-    ///
-    /// Parameters:
-    ///   `token_id`: input token ID
-    ///   `position`: position index in the sequence
-    ///   `rope`: precomputed RoPE frequencies
-    ///   `kv_caches`: one KV cache per layer
-    ///   `logits`: output logits buffer [vocab_size]
     pub fn forward(
         &self,
         token_id: usize,
@@ -125,22 +67,31 @@ impl Transformer {
     ) {
         assert_eq!(kv_caches.len(), self.layers.len());
 
-        // --- Token embedding lookup ---
-        let emb_start = token_id * self.embed_dim;
         let mut hidden = vec![0.0f32; self.embed_dim];
-        hidden.copy_from_slice(&self.token_embd[emb_start..emb_start + self.embed_dim]);
+        for dim in 0..self.embed_dim {
+            hidden[dim] = self.token_embd[self.embed_dim * token_id + dim];
+        }
 
-        // --- Process through transformer layers ---
         let mut layer_output = vec![0.0f32; self.embed_dim];
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward(&hidden, position, rope, &mut kv_caches[i], &mut layer_output);
+            if position == 0 && cfg!(debug_assertions) {
+                let hmin = layer_output.iter().cloned().fold(f32::MAX, f32::min);
+                let hmax = layer_output.iter().cloned().fold(f32::MIN, f32::max);
+                let mean = layer_output.iter().sum::<f32>() / layer_output.len() as f32;
+                eprintln!("  [L{}] min={:9.4} max={:9.4} mean={:9.4} h0..3={:.4},{:.4},{:.4},{:.4}",
+                    i, hmin, hmax, mean, layer_output[0], layer_output[1], layer_output[2], layer_output[3]);
+            }
             std::mem::swap(&mut hidden, &mut layer_output);
         }
-
-        // --- Final RMSNorm ---
         self.final_norm.forward_inplace(&mut hidden);
-
-        // --- LM head: logits = hidden @ W_lm_head^T ---
+        if position == 0 && cfg!(debug_assertions) {
+            let hmin = hidden.iter().cloned().fold(f32::MAX, f32::min);
+            let hmax = hidden.iter().cloned().fold(f32::MIN, f32::max);
+            let mean = hidden.iter().sum::<f32>() / hidden.len() as f32;
+            eprintln!("  [FNL] min={:9.4} max={:9.4} mean={:9.4} h0..3={:.4},{:.4},{:.4},{:.4}",
+                hmin, hmax, mean, hidden[0], hidden[1], hidden[2], hidden[3]);
+        }
         math::mat_vec_mul_transposed(&self.lm_head, &hidden, logits, self.vocab_size, self.embed_dim);
     }
 }

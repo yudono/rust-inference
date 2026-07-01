@@ -34,7 +34,7 @@ use std::path::Path;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 pub const GGUF_VERSION: u32 = 3;
-pub const ALIGNMENT: usize = 512; // Default data alignment in GGUF
+pub const ALIGNMENT: usize = 32; // GGUF v3 default alignment
 
 // ============================================================================
 // Data Types
@@ -94,7 +94,7 @@ impl GgufDataType {
             Self::F16 => 2.0,
             Self::Q4_0 => 18.0 / 32.0,
             Self::Q4_1 => 20.0 / 32.0,
-            Self::Q5_0 => 30.0 / 32.0,
+            Self::Q5_0 => 22.0 / 32.0,
             Self::Q5_1 => 34.0 / 32.0,
             Self::Q8_0 => 34.0 / 32.0,
             Self::Q8_1 => 40.0 / 32.0,
@@ -113,7 +113,7 @@ impl GgufDataType {
             Self::F16 => 2,
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
-            Self::Q5_0 => 30,
+            Self::Q5_0 => 22,
             Self::Q5_1 => 34,
             Self::Q8_0 => 34,
             Self::Q8_1 => 40,
@@ -329,11 +329,7 @@ impl GgufFile {
         let current_pos = reader.stream_position()?;
         let data_offset = align_to(current_pos, ALIGNMENT);
 
-        eprintln!("GGUF Header parsed:");
-        eprintln!("  Version:       {}", version);
-        eprintln!("  Tensor count:  {}", n_tensors);
-        eprintln!("  Metadata keys: {}", n_kv);
-        eprintln!("  Data offset:   0x{:X}", data_offset);
+    
 
         Ok(GgufFile {
             version,

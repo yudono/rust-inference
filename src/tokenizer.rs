@@ -22,6 +22,32 @@ use std::collections::HashMap;
 
 use crate::gguf::MetadataValue;
 
+// GPT-2 / tiktoken byte-to-unicode encoder table
+fn bytes_to_unicode() -> (Vec<u8>, Vec<char>) {
+    // Collect all bytes that are "printable" in Latin-1
+    let mut bs: Vec<u8> = (b'!'..=b'~').collect();     // 33..126
+    bs.extend(b'\xa1'..=b'\xac');                        // 161..172
+    bs.extend(b'\xae'..=b'\xff');                        // 174..255
+    // cs starts as a copy of bs (safe bytes map to themselves)
+    let mut cs: Vec<char> = bs.iter().map(|&b| std::char::from_u32(b as u32).unwrap()).collect();
+    let initial_len = bs.len();
+    // Append remaining bytes (0..32, 127..160, 173) with codepoints 256+
+    let mut n = 0u32;
+    for b in 0..=255u8 {
+        if !bs[..initial_len].contains(&b) {
+            bs.push(b);
+            cs.push(std::char::from_u32(256 + n).unwrap());
+            n += 1;
+        }
+    }
+    (bs, cs)
+}
+
+fn byte_decoder() -> HashMap<char, u8> {
+    let (bs, cs) = bytes_to_unicode();
+    cs.iter().zip(bs.iter()).map(|(c, b)| (*c, *b)).collect()
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -154,13 +180,6 @@ impl Tokenizer {
             .and_then(|v| v.to_i32())
             .map(|v| v as usize);
 
-        eprintln!("Tokenizer loaded:");
-        eprintln!("  Vocab size: {}", vocab.len());
-        eprintln!("  Merge rules: {}", merges.len());
-        eprintln!("  Pre-type: {}", pre_type);
-        eprintln!("  BOS token: {:?}", bos_token_id);
-        eprintln!("  EOS token: {:?}", eos_token_id);
-
         Tokenizer {
             vocab,
             vocab_map,
@@ -184,19 +203,44 @@ impl Tokenizer {
         all_ids
     }
 
-    /// Decode token IDs back to text
+    /// Decode token IDs back to text (handles Qwen2 byte-level BPE)
     pub fn decode(&self, ids: &[usize]) -> String {
-        let mut result = String::new();
+        let decoder = byte_decoder();
+        let mut raw = String::new();
         for &id in ids {
-            if id < self.vocab.len() {
-                let text = &self.vocab[id].text;
-                // Skip control tokens (like BOS/EOS)
-                if self.vocab[id].token_type != TokenType::Control {
-                    result.push_str(text);
-                }
+            if id >= self.vocab.len() {
+                continue;
+            }
+            let token = &self.vocab[id];
+            match token.token_type {
+                TokenType::Control => {}
+                _ => raw.push_str(&token.text),
             }
         }
-        result
+        // Convert byte-encoded chars back to bytes
+        let bytes: Vec<u8> = raw.chars().filter_map(|c| decoder.get(&c).copied()).collect();
+        String::from_utf8(bytes).unwrap_or_else(|e| {
+            let bytes = e.into_bytes();
+            String::from_utf8_lossy(&bytes).to_string()
+        })
+    }
+    
+    /// Decode a single token ID to raw bytes (for streaming)
+    pub fn decode_token_bytes(&self, id: usize) -> Vec<u8> {
+        let decoder = byte_decoder();
+        if id >= self.vocab.len() {
+            return Vec::new();
+        }
+        let token = &self.vocab[id];
+        match token.token_type {
+            TokenType::Control => Vec::new(),
+            _ => token.text.chars().filter_map(|c| decoder.get(&c).copied()).collect(),
+        }
+    }
+    
+    /// Decode a single token ID to text (for streaming)
+    pub fn decode_token(&self, id: usize) -> Option<String> {
+        Some(self.decode(&[id]))
     }
 
     /// Pre-tokenize: split input into pieces based on the pre-tokenizer type
@@ -222,32 +266,57 @@ impl Tokenizer {
     /// BPE-style pre-tokenizer: split into word pieces, respecting punctuation
     /// This implements a simplified LLaMA-style pre-tokenization
     fn pre_tokenize_bpe(&self, text: &str) -> Vec<String> {
+        // GPT-2/tiktoken style: spaces before words are attached to the word.
+        // We scan character-by-character, accumulating into a current piece.
         let mut pieces = Vec::new();
         let mut current = String::new();
+        let mut pending_space = false;
+        let mut chars = text.chars().peekable();
 
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                current.push(ch);
-            } else if ch.is_ascii_whitespace() {
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii_whitespace() {
+                // Whitespace: flush current word and remember for prefix
                 if !current.is_empty() {
                     pieces.push(std::mem::take(&mut current));
                 }
-                pieces.push(ch.to_string());
-            } else if ch.is_ascii_punctuation() {
-                if !current.is_empty() {
-                    pieces.push(std::mem::take(&mut current));
-                }
-                pieces.push(ch.to_string());
+                // Check if this space is followed by a word/letter
+                pending_space = true;
             } else {
-                // Non-ASCII: treat as a separate piece
-                if !current.is_empty() {
-                    pieces.push(std::mem::take(&mut current));
+                // Non-whitespace character
+                if pending_space && (ch.is_ascii_alphanumeric() || !ch.is_ascii()) {
+                    // Prepend the space to this word piece
+                    current.push(' ');
+                    pending_space = false;
+                } else if pending_space {
+                    // Space before punctuation/other: flush space first
+                    pieces.push(" ".to_string());
+                    pending_space = false;
                 }
-                pieces.push(ch.to_string());
+
+                if ch.is_ascii_alphanumeric() {
+                    current.push(ch);
+                } else if ch.is_ascii_punctuation() {
+                    // Punctuation: flush current and push as separate piece
+                    if !current.is_empty() {
+                        pieces.push(std::mem::take(&mut current));
+                    }
+                    pieces.push(ch.to_string());
+                } else {
+                    // Non-ASCII: flush current and push as separate piece
+                    if !current.is_empty() {
+                        pieces.push(std::mem::take(&mut current));
+                    }
+                    pieces.push(ch.to_string());
+                }
             }
         }
+
+        // Flush remaining
         if !current.is_empty() {
             pieces.push(current);
+        }
+        if pending_space {
+            pieces.push(" ".to_string());
         }
 
         pieces
@@ -262,11 +331,19 @@ impl Tokenizer {
         // Start with individual bytes
         let bytes: Vec<u8> = piece.bytes().collect();
 
-        // Convert bytes to token strings
-        // Check if each byte maps directly to a vocabulary token
+        // Convert bytes to token strings for BPE (byte-level / tiktoken style).
+        // For bytes 0-255, the corresponding token text is the Unicode character
+        // at that codepoint (Latin-1 interpretation for bytes 128-255).
         let mut tokens: Vec<String> = Vec::new();
         for &b in &bytes {
-            tokens.push(format!("<0x{:02X}>", b));
+            let raw = char::from_u32(b as u32).unwrap().to_string();
+            if self.vocab_map.contains_key(&raw) {
+                tokens.push(raw);
+            } else {
+                // Fallback: use explicit byte encoding as char(256+b)
+                let byte_token = char::from_u32(256 + b as u32).unwrap().to_string();
+                tokens.push(byte_token);
+            }
         }
 
         // Apply BPE merges
@@ -309,10 +386,6 @@ impl Tokenizer {
 
     /// Look up token ID from token text
     fn token_to_id(&self, token: &str) -> usize {
-        if let Some(&id) = self.vocab_map.get(token) {
-            return id;
-        }
-        // Try the token text directly (not byte-escaped)
         if let Some(&id) = self.vocab_map.get(token) {
             return id;
         }
