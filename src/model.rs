@@ -139,8 +139,6 @@ impl Model {
             config.max_seq_len = max_len;
         }
 
-        eprintln!("Config: {} - {} layers, {} embed", config.architecture, config.n_layers, config.embed_dim);
-
         // --- Load tokenizer ---
         let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
 
@@ -220,10 +218,8 @@ impl Model {
 
         // Load LM head (may be tied with token embeddings)
         let lm_head = if let Some(w) = tensors.remove("output.weight") {
-            eprintln!("  Using separate output.weight for lm_head ({} elements)", w.len());
             w
         } else {
-            eprintln!("  Using token_embd (tied weights) for lm_head ({} elements)", token_embd.len());
             token_embd.clone()
         };
 
@@ -343,8 +339,6 @@ impl Model {
             max_seq_len: config.max_seq_len,
         };
 
-        eprintln!("Model loaded.\n");
-
         Ok(Model {
             transformer,
             tokenizer,
@@ -360,9 +354,7 @@ impl Model {
         max_tokens: usize,
         sampler_config: SamplerConfig,
     ) -> String {
-        use std::io::{self, Write};
-        use std::time::Instant;
-
+        use std::io::Write;
         let mut sampler = Sampler::new(sampler_config);
         let mut kv_caches: Vec<KVCache> = (0..self.config.n_layers)
             .map(|_| {
@@ -378,29 +370,17 @@ impl Model {
         let mut logits = vec![0.0f32; self.config.vocab_size];
 
         // --- Process prompt tokens (prefill) ---
-        let prefill_start = Instant::now();
         for (pos, &token_id) in prompt_ids.iter().enumerate() {
             self.transformer
                 .forward(token_id, pos, &self.rope, &mut kv_caches, &mut logits);
             all_token_ids.push(token_id);
         }
-        let prefill_time = prefill_start.elapsed();
-        let prefill_tps = prompt_ids.len() as f64 / prefill_time.as_secs_f64();
 
         // --- Generate new tokens ---
         let mut current_pos = prompt_ids.len();
         let mut generated_text = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut consumed = 0;
-
-        // Print prompt first
-        eprint!("{}", prompt);
-        io::stderr().flush().ok();
-
-        let mut generated_tokens = 0;
-        let gen_start = Instant::now();
-        let mut last_print = Instant::now();
-        let mut tokens_since_last_print = 0;
 
         for _step in 0..max_tokens {
             // Sample next token
@@ -451,22 +431,7 @@ impl Model {
                     }
                 }
             }
-            io::stdout().flush().ok();
-
-            generated_tokens += 1;
-            tokens_since_last_print += 1;
-
-            // Show TPS every 10 tokens
-            if tokens_since_last_print >= 10 {
-                let elapsed = last_print.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    let tps = tokens_since_last_print as f64 / elapsed;
-                    eprint!("\r[TPS: {:.1}]", tps);
-                    io::stderr().flush().ok();
-                }
-                tokens_since_last_print = 0;
-                last_print = Instant::now();
-            }
+            std::io::stdout().flush().ok();
 
             // Forward pass for the new token
             self.transformer.forward(
@@ -481,8 +446,6 @@ impl Model {
             current_pos += 1;
         }
 
-        let gen_time = gen_start.elapsed();
-        
         // Flush remaining bytes in the buffer
         while consumed < byte_buf.len() {
             match std::str::from_utf8(&byte_buf[consumed..]) {
@@ -509,18 +472,9 @@ impl Model {
                 }
             }
         }
-        io::stdout().flush().ok();
-        
-        let gen_tps = if gen_time.as_secs_f64() > 0.0 {
-            generated_tokens as f64 / gen_time.as_secs_f64()
-        } else {
-            0.0
-        };
+        std::io::stdout().flush().ok();
         
         println!();
-        eprintln!("\n--- Generation Stats ---");
-        eprintln!("  Prefill: {} tokens in {:.2}s ({:.1} tok/s)", prompt_ids.len(), prefill_time.as_secs_f64(), prefill_tps);
-        eprintln!("  Generate: {} tokens in {:.2}s ({:.1} tok/s)", generated_tokens, gen_time.as_secs_f64(), gen_tps);
         
         generated_text
     }

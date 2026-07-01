@@ -204,10 +204,6 @@ fn main() {
         }
     };
 
-    eprintln!("========================================");
-    eprintln!("  GGUF Rust Inference Engine (Pure Rust)");
-    eprintln!("========================================\n");
-
     // Load model
     let mut model = match Model::load(&args.model_path, args.max_seq_len) {
         Ok(m) => m,
