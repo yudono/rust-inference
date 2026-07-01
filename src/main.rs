@@ -17,6 +17,8 @@
 //   --seed         Random seed (default: 12345)
 //   --max-seq-len  Maximum sequence length (default: from model)
 
+#![allow(dead_code, non_camel_case_types)]
+
 mod attention;
 mod gguf;
 mod kv_cache;
