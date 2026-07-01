@@ -380,8 +380,8 @@ impl Model {
             // Decode token to raw bytes and buffer them for UTF-8 streaming
             let bytes = self.tokenizer.decode_token_bytes(next_token);
             
-            // Check if this token starts a special token sequence (e.g., <|im_end|>)
-            if is_special_token_prefix_bytes(&bytes, &byte_buf[consumed..]) {
+            // Check if this token forms a special token with recently flushed text
+            if would_form_special_token(&generated_text, &byte_buf[consumed..], &bytes) {
                 break;
             }
             
@@ -474,23 +474,24 @@ impl Model {
     }
 }
 
-fn special_token_prefixes() -> &'static [&'static str] {
-    &["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
-}
-
-/// Known token prefixes that indicate the model started generating a special token.
-/// These are checked post-hoc and at streaming boundaries.
 fn special_token_starts() -> &'static [&'static str] {
     &["<|im_end|>", "<|endoftext|>", "<|im_start|>", "<|"]
 }
 
-fn is_special_token_prefix_bytes(new_bytes: &[u8], unflushed_tail: &[u8]) -> bool {
+/// Check if adding new_bytes would form a special token pattern when combined
+/// with already-flushed text and unflushed bytes in the buffer.
+/// This handles the case where `<` and `|` arrive in separate tokens.
+fn would_form_special_token(flushed: &str, unflushed: &[u8], new_bytes: &[u8]) -> bool {
     if new_bytes.is_empty() {
         return false;
     }
     let prefixes = special_token_starts();
+    // Check flushed text tail + unflushed + new bytes
+    let tail_len = 8; // max prefix length
+    let tail: String = flushed.chars().rev().take(tail_len).collect::<Vec<_>>().into_iter().rev().collect();
     let mut test = Vec::new();
-    test.extend_from_slice(unflushed_tail);
+    test.extend_from_slice(tail.as_bytes());
+    test.extend_from_slice(unflushed);
     test.extend_from_slice(new_bytes);
     if let Ok(s) = std::str::from_utf8(&test) {
         for prefix in prefixes {
@@ -510,7 +511,9 @@ fn strip_special_tokens(text: &str) -> String {
             result.truncate(pos);
         }
     }
-    result.trim().to_string()
+    // Also remove trailing < or | that might be partial special token starts
+    result = result.trim_end_matches('<').trim_end_matches('|').trim().to_string();
+    result
 }
 
 // Helper module for reading tensor data from file
