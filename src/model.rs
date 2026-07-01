@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::attention::Attention;
+use crate::chat_template::ChatTemplate;
 use crate::gguf::{GgufFile, GgufDataType, MetadataValue};
 use crate::gpu_backend::GpuContext;
 use crate::kv_cache::KVCache;
@@ -127,6 +128,7 @@ pub struct Model {
     pub config: ModelConfig,
     pub rope: RoPE,
     pub gpu: Option<GpuContext>,
+    pub chat_template: Option<ChatTemplate>,
 }
 
 impl Model {
@@ -143,6 +145,9 @@ impl Model {
 
         // --- Load tokenizer ---
         let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
+
+        // --- Load chat template ---
+        let chat_template = ChatTemplate::from_metadata(&gguf.metadata);
 
         // --- Precompute RoPE frequencies ---
         let head_dim = config.embed_dim / config.n_heads;
@@ -310,15 +315,17 @@ impl Model {
             config,
             rope,
             gpu: None,
+            chat_template,
         })
     }
 
-    /// Generate text given a prompt, streaming output to stdout with TPS display
+    /// Generate text given a prompt, streaming output to stdout
     pub fn generate(
         &mut self,
         prompt: &str,
         max_tokens: usize,
         sampler_config: SamplerConfig,
+        system_prompt: Option<&str>,
     ) -> String {
         use std::io::Write;
         let mut sampler = Sampler::new(sampler_config);
@@ -329,8 +336,14 @@ impl Model {
             })
             .collect();
 
+        // Apply chat template if available
+        let formatted_prompt = match &self.chat_template {
+            Some(ct) => ct.apply(prompt, system_prompt),
+            None => prompt.to_string(),
+        };
+
         // Encode prompt (Qwen2 does NOT use BOS token, despite GGUF metadata having it)
-        let prompt_ids = self.tokenizer.encode(prompt);
+        let prompt_ids = self.tokenizer.encode(&formatted_prompt);
 
         let mut all_token_ids: Vec<usize> = Vec::new();
         let mut logits = vec![0.0f32; self.config.vocab_size];
@@ -357,15 +370,21 @@ impl Model {
             };
             let next_token = sampler.sample(&mut logits, recent);
 
-            // Check for end-of-sequence
-            if let Some(eos_id) = self.tokenizer.eos_token_id {
-                if next_token == eos_id {
-                    break;
-                }
+            // Check for end-of-sequence or chat end-of-turn
+            let is_eos = self.tokenizer.eos_token_id.map_or(false, |eos| next_token == eos);
+            let is_im_end = self.tokenizer.im_end_token_id.map_or(false, |im| next_token == im);
+            if is_eos || is_im_end {
+                break;
             }
 
             // Decode token to raw bytes and buffer them for UTF-8 streaming
             let bytes = self.tokenizer.decode_token_bytes(next_token);
+            
+            // Check if this token starts a special token sequence (e.g., <|im_end|>)
+            if is_special_token_prefix_bytes(&bytes, &byte_buf[consumed..]) {
+                break;
+            }
+            
             byte_buf.extend_from_slice(&bytes);
             // Flush as much valid UTF-8 as possible, replacing invalid bytes
             loop {
@@ -443,6 +462,9 @@ impl Model {
         
         println!();
         
+        // Strip special token artifacts from output
+        let generated_text = strip_special_tokens(&generated_text);
+        
         generated_text
     }
 
@@ -450,6 +472,45 @@ impl Model {
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
+}
+
+fn special_token_prefixes() -> &'static [&'static str] {
+    &["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
+}
+
+/// Known token prefixes that indicate the model started generating a special token.
+/// These are checked post-hoc and at streaming boundaries.
+fn special_token_starts() -> &'static [&'static str] {
+    &["<|im_end|>", "<|endoftext|>", "<|im_start|>", "<|"]
+}
+
+fn is_special_token_prefix_bytes(new_bytes: &[u8], unflushed_tail: &[u8]) -> bool {
+    if new_bytes.is_empty() {
+        return false;
+    }
+    let prefixes = special_token_starts();
+    let mut test = Vec::new();
+    test.extend_from_slice(unflushed_tail);
+    test.extend_from_slice(new_bytes);
+    if let Ok(s) = std::str::from_utf8(&test) {
+        for prefix in prefixes {
+            if s.contains(prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_special_tokens(text: &str) -> String {
+    let mut result = text.to_string();
+    // Remove from first occurrence of any special token pattern (full or start)
+    for pattern in special_token_starts() {
+        if let Some(pos) = result.find(pattern) {
+            result.truncate(pos);
+        }
+    }
+    result.trim().to_string()
 }
 
 // Helper module for reading tensor data from file

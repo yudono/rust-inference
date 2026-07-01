@@ -101,6 +101,9 @@ pub struct Tokenizer {
     /// Special tokens
     pub bos_token_id: Option<usize>,
     pub eos_token_id: Option<usize>,
+    /// Token IDs for common stop tokens (e.g., ChatML end-of-turn)
+    pub im_end_token_id: Option<usize>,
+    pub im_start_token_id: Option<usize>,
 }
 
 impl Tokenizer {
@@ -180,6 +183,10 @@ impl Tokenizer {
             .and_then(|v| v.to_i32())
             .map(|v| v as usize);
 
+        // Look up common chat template stop tokens from vocab
+        let im_end_token_id = vocab_map.get("<|im_end|>").copied();
+        let im_start_token_id = vocab_map.get("<|im_start|>").copied();
+
         Tokenizer {
             vocab,
             vocab_map,
@@ -187,6 +194,8 @@ impl Tokenizer {
             pre_type,
             bos_token_id,
             eos_token_id,
+            im_end_token_id,
+            im_start_token_id,
         }
     }
 

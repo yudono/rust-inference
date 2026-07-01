@@ -30,6 +30,7 @@ cargo build --release
 | `--top-p` | | 0.95 | Nucleus sampling threshold |
 | `--seed` | `-s` | 12345 | Random seed for reproducibility |
 | `--max-seq-len` | | (from model) | Override max sequence length |
+| `--system` | | (none) | System prompt for instruct models |
 | `--cpu` | | auto | Force CPU backend |
 | `--gpu` | | auto | Force GPU backend |
 
@@ -140,6 +141,24 @@ GPU performance pending optimization (current per-call staging buffers bottlenec
 
 ---
 
+## Chat Template (Instruct Models)
+
+GGUF metadata typically includes a `tokenizer.chat_template` string (Jinja2 format). When present, the engine **automatically wraps prompts** in the correct chat format for that model:
+
+- **ChatML (Qwen2/Qwen2.5)**: `<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`
+- **Llama 3**: `<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|>`
+- **Llama 2**: `[INST] ... [/INST]`
+
+Without this formatting, instruct models produce irrelevant output (the raw prompt doesn't match their training format).
+
+To add a system prompt:
+
+```bash
+./target/release/gguf-infer --model model.gguf --prompt "Hello" --system "Always respond in English."
+```
+
+---
+
 ## Project Structure
 
 ```
@@ -162,6 +181,7 @@ src/
 |   +-- Q6_K falls back to CPU (GPU execution bug)
 |
 +-- tokenizer.rs     # BPE tokenizer
++-- chat_template.rs # Chat template engine (ChatML, Llama3, Llama2)
 +-- rope.rs          # Rotary Position Embedding
 +-- rmsnorm.rs       # RMS Normalization
 +-- attention.rs     # Multi-Head Self-Attention (GQA)
@@ -197,6 +217,7 @@ src/
 - Sliding window attention not implemented (Mistral)
 - Qwen2 does not use BOS token (despite GGUF metadata)
 - `output.weight` is optional; when missing, `token_embd.weight` is used as tied lm_head
+- Chat template detection is heuristic (known formats only); full Jinja2 parser not implemented
 
 ## License
 

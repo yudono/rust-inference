@@ -20,6 +20,7 @@
 #![allow(dead_code, non_camel_case_types)]
 
 mod attention;
+mod chat_template;
 mod gguf;
 mod gpu_backend;
 mod kv_cache;
@@ -54,6 +55,7 @@ struct Args {
     max_seq_len: Option<usize>,
     interactive: bool,
     use_gpu: Option<bool>,
+    system_prompt: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -68,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
     let mut max_seq_len: Option<usize> = None;
     let mut interactive = false;
     let mut use_gpu: Option<bool> = None;
+    let mut system_prompt: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -137,6 +140,14 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("Invalid --max-seq-len: {}", e))?,
                 );
             }
+            "--system" => {
+                i += 1;
+                system_prompt = Some(
+                    args.get(i)
+                        .ok_or("--system requires a value")?
+                        .clone(),
+                );
+            }
             "--interactive" | "-i" => {
                 interactive = true;
             }
@@ -180,6 +191,7 @@ fn parse_args() -> Result<Args, String> {
         max_seq_len,
         interactive,
         use_gpu,
+        system_prompt,
     })
 }
 
@@ -199,6 +211,7 @@ fn print_usage() {
     eprintln!("  --top-p            Top-P nucleus sampling (default: 0.95)");
     eprintln!("  --seed, -s         Random seed (default: 12345)");
     eprintln!("  --max-seq-len      Override max sequence length");
+    eprintln!("  --system           System prompt for chat template");
     eprintln!("  --cpu              Force CPU backend (default: auto)");
     eprintln!("  --gpu              Force GPU backend (default: auto)");
     eprintln!("  --help, -h         Show this help message");
@@ -272,7 +285,7 @@ fn main() {
                     
                     // Generate response
                     eprintln!();
-                    let _ = model.generate(input, args.max_tokens, args.sampler_config.clone());
+                    let _ = model.generate(input, args.max_tokens, args.sampler_config.clone(), args.system_prompt.as_deref());
                     eprintln!();
                 }
                 Err(e) => {
@@ -291,6 +304,6 @@ fn main() {
             }
         };
         
-        let _ = model.generate(&prompt, args.max_tokens, args.sampler_config);
+        let _ = model.generate(&prompt, args.max_tokens, args.sampler_config, args.system_prompt.as_deref());
     }
 }
