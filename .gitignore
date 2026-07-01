@@ -6,3 +6,6 @@ Cargo.lock
 __pycache__/
 .env
 .DS_Store
+debug/
+memory.md
+test_inference.sh
