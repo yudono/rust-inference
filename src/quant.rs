@@ -32,6 +32,7 @@
 
 use std::cmp;
 use crate::gguf::GgufDataType;
+use crate::gpu_backend::GpuContext;
 
 // ============================================================================
 // QuantizedMatrix — On-the-fly dequantization + mat-vec
@@ -173,12 +174,19 @@ impl QuantizedMatrix {
     }
 
     /// Quantized mat-vec-mul-transposed: out[row] = Σ_col W[col, row] * x[col]
-    /// Equivalent to `mat_vec_mul_transposed(f32_data, x, out, rows, cols)`.
-    pub fn mat_vec_mul(&self, x: &[f32], out: &mut [f32]) {
+    /// If `gpu` is Some, dispatches to GPU compute shader; otherwise uses CPU.
+    pub fn mat_vec_mul(&self, x: &[f32], out: &mut [f32], gpu: Option<&GpuContext>) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(out.len(), self.rows);
-        out.fill(0.0);
 
+        // Dispatch to GPU if available
+        if let Some(gpu_ctx) = gpu {
+            gpu_ctx.mat_vec_mul(&self.data, self.dtype, x, out, self.rows, self.cols);
+            return;
+        }
+
+        // CPU fallback: dequantize block-by-block
+        out.fill(0.0);
         let total = self.rows * self.cols;
         let bs = self.block_size();
         let n_blocks = (total + bs - 1) / bs;
@@ -254,7 +262,7 @@ fn dequant_q5_k_block(slice: &[u8], buf: &mut [f32]) {
 }
 
 /// Block-level Q6_K dequant
-fn dequant_q6_k_block(slice: &[u8], buf: &mut [f32]) {
+pub fn dequant_q6_k_block(slice: &[u8], buf: &mut [f32]) {
     let ql = &slice[0..128];
     let qh = &slice[128..192];
     let sc_raw = &slice[192..208];

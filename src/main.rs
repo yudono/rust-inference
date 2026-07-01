@@ -21,6 +21,7 @@
 
 mod attention;
 mod gguf;
+mod gpu_backend;
 mod kv_cache;
 mod math;
 mod mlp;
@@ -37,6 +38,7 @@ use std::env;
 use std::io::{self, Write, BufRead};
 use std::path::PathBuf;
 
+use gpu_backend::GpuContext;
 use model::Model;
 use sampler::SamplerConfig;
 
@@ -51,6 +53,7 @@ struct Args {
     sampler_config: SamplerConfig,
     max_seq_len: Option<usize>,
     interactive: bool,
+    use_gpu: Option<bool>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = 12345u64;
     let mut max_seq_len: Option<usize> = None;
     let mut interactive = false;
+    let mut use_gpu: Option<bool> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -136,6 +140,12 @@ fn parse_args() -> Result<Args, String> {
             "--interactive" | "-i" => {
                 interactive = true;
             }
+            "--cpu" => {
+                use_gpu = Some(false);
+            }
+            "--gpu" => {
+                use_gpu = Some(true);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -169,6 +179,7 @@ fn parse_args() -> Result<Args, String> {
         },
         max_seq_len,
         interactive,
+        use_gpu,
     })
 }
 
@@ -188,6 +199,8 @@ fn print_usage() {
     eprintln!("  --top-p            Top-P nucleus sampling (default: 0.95)");
     eprintln!("  --seed, -s         Random seed (default: 12345)");
     eprintln!("  --max-seq-len      Override max sequence length");
+    eprintln!("  --cpu              Force CPU backend (default: auto)");
+    eprintln!("  --gpu              Force GPU backend (default: auto)");
     eprintln!("  --help, -h         Show this help message");
 }
 
@@ -206,6 +219,27 @@ fn main() {
         }
     };
 
+    // Initialize GPU context (if requested or auto-detect)
+    let gpu = match args.use_gpu {
+        Some(true) => {
+            eprintln!("Initializing GPU backend...");
+            GpuContext::try_init()
+        }
+        Some(false) => {
+            eprintln!("CPU backend (--cpu flag)");
+            None
+        }
+        None => {
+            // Auto-detect: try GPU, fall back to CPU
+            GpuContext::try_init()
+        }
+    };
+    if gpu.is_some() {
+        eprintln!("GPU backend initialized");
+    } else if args.use_gpu == Some(true) {
+        eprintln!("WARNING: --gpu requested but no GPU adapter found, falling back to CPU");
+    }
+
     // Load model
     let mut model = match Model::load(&args.model_path, args.max_seq_len) {
         Ok(m) => m,
@@ -214,6 +248,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    model.gpu = gpu;
 
     if args.interactive {
         // Interactive mode

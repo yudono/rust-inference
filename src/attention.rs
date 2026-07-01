@@ -1,3 +1,4 @@
+use crate::gpu_backend::GpuContext;
 use crate::kv_cache::KVCache;
 use crate::math;
 use crate::quant::QuantizedMatrix;
@@ -57,20 +58,21 @@ impl Attention {
         rope: &RoPE,
         cache: &mut KVCache,
         output: &mut [f32],
+        gpu: Option<&GpuContext>,
     ) {
         let kv_dim = self.n_kv_heads * self.head_dim;
         let q_dim = self.n_heads * self.head_dim;
 
         let mut q = vec![0.0f32; q_dim];
-        self.wq.mat_vec_mul(x, &mut q);
+        self.wq.mat_vec_mul(x, &mut q, gpu);
         math::vec_add_inplace(&mut q, &self.bq);
 
         let mut k = vec![0.0f32; kv_dim];
-        self.wk.mat_vec_mul(x, &mut k);
+        self.wk.mat_vec_mul(x, &mut k, gpu);
         math::vec_add_inplace(&mut k, &self.bk);
 
         let mut v = vec![0.0f32; kv_dim];
-        self.wv.mat_vec_mul(x, &mut v);
+        self.wv.mat_vec_mul(x, &mut v, gpu);
         math::vec_add_inplace(&mut v, &self.bv);
 
         for h in 0..self.n_heads {
@@ -118,7 +120,7 @@ impl Attention {
             }
         }
 
-        self.wo.mat_vec_mul(&attn_output, output);
+        self.wo.mat_vec_mul(&attn_output, output, gpu);
     }
 
     pub fn n_rep(&self) -> usize {

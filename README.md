@@ -91,9 +91,9 @@ QuantizedMatrix::mat_vec_mul()
    GpuContext::mat_vec_mul()        fallback_cpu()
         |                                |
    wgpu dispatch                   dequant per block
-   (per-element shader)            (scalar, no SIMD)
-        |
-   atomicAdd per row
+   (1 workgroup per row,           (scalar, no SIMD)
+    256 threads per workgroup,
+    shared-memory reduction)
         |
    readback to staging buffer
 ```
@@ -111,7 +111,9 @@ QuantizedMatrix::mat_vec_mul()
 | Q5_K | Sub-block scales + nibble + high-bit |
 | Q6_K | Sub-block scales + 6-bit values |
 
-All shaders use **one thread per element** with `atomicAdd` for output accumulation. Auto GPU/CPU detection; force with `--cpu` or `--gpu`. When GPU is unavailable, falls back to CPU.
+All shaders use **one workgroup per row, 256 threads per workgroup** with shared-memory reduction for output accumulation. Auto GPU/CPU detection; force with `--cpu` or `--gpu`. When GPU is unavailable, falls back to CPU.
+
+> **Note**: Q6_K currently falls back to CPU due to a Metal/Naga GPU execution bug. Q4_K on GPU is verified correct (max_diff ≈ 1e-5 vs CPU).
 
 ---
 
@@ -156,7 +158,8 @@ src/
 +-- gpu_backend.rs   # GPU compute (wgpu + WGSL)
 |   +-- GpuContext: device, queue, cached pipelines
 |   +-- WGSL shaders for all 8 quant types
-|   +-- mat_vec_mul dispatch with per-element atomicAdd
+|   +-- mat_vec_mul dispatch with shared-memory reduction
+|   +-- Q6_K falls back to CPU (GPU execution bug)
 |
 +-- tokenizer.rs     # BPE tokenizer
 +-- rope.rs          # Rotary Position Embedding
@@ -189,6 +192,7 @@ src/
 
 - No SIMD intrinsics for CPU path (compiler auto-vectorization only)
 - GPU backend creates per-call staging buffers (optimization deferred)
+- Q6_K GPU WGSL dequant has a Metal/Naga execution bug — falls back to CPU
 - KV cache is f32 (not quantized), grows with sequence length
 - Sliding window attention not implemented (Mistral)
 - Qwen2 does not use BOS token (despite GGUF metadata)

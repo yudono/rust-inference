@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::attention::Attention;
 use crate::gguf::{GgufFile, GgufDataType, MetadataValue};
+use crate::gpu_backend::GpuContext;
 use crate::kv_cache::KVCache;
 use crate::mlp::Mlp;
 use crate::quant::QuantizedMatrix;
@@ -125,6 +126,7 @@ pub struct Model {
     pub tokenizer: Tokenizer,
     pub config: ModelConfig,
     pub rope: RoPE,
+    pub gpu: Option<GpuContext>,
 }
 
 impl Model {
@@ -307,6 +309,7 @@ impl Model {
             tokenizer,
             config,
             rope,
+            gpu: None,
         })
     }
 
@@ -335,7 +338,7 @@ impl Model {
         // --- Process prompt tokens (prefill) ---
         for (pos, &token_id) in prompt_ids.iter().enumerate() {
             self.transformer
-                .forward(token_id, pos, &self.rope, &mut kv_caches, &mut logits);
+                .forward(token_id, pos, &self.rope, &mut kv_caches, &mut logits, self.gpu.as_ref());
             all_token_ids.push(token_id);
         }
 
@@ -403,6 +406,7 @@ impl Model {
                 &self.rope,
                 &mut kv_caches,
                 &mut logits,
+                self.gpu.as_ref(),
             );
 
             all_token_ids.push(next_token);

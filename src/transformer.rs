@@ -1,4 +1,5 @@
 use crate::attention::Attention;
+use crate::gpu_backend::GpuContext;
 use crate::kv_cache::KVCache;
 use crate::math;
 use crate::mlp::Mlp;
@@ -23,6 +24,7 @@ impl TransformerLayer {
         rope: &RoPE,
         kv_cache: &mut KVCache,
         output: &mut [f32],
+        gpu: Option<&GpuContext>,
     ) {
         let embed_dim = x.len();
 
@@ -31,7 +33,7 @@ impl TransformerLayer {
 
         let mut attn_out = vec![0.0f32; embed_dim];
         self.attention
-            .forward(&x_norm, position, rope, kv_cache, &mut attn_out);
+            .forward(&x_norm, position, rope, kv_cache, &mut attn_out, gpu);
 
         output.copy_from_slice(x);
         math::vec_add_inplace(output, &attn_out);
@@ -40,7 +42,7 @@ impl TransformerLayer {
         self.ffn_norm.forward(output, &mut x_norm2);
 
         let mut ffn_out = vec![0.0f32; embed_dim];
-        self.mlp.forward(&x_norm2, &mut ffn_out);
+        self.mlp.forward(&x_norm2, &mut ffn_out, gpu);
 
         math::vec_add_inplace(output, &ffn_out);
     }
@@ -65,6 +67,7 @@ impl Transformer {
         rope: &RoPE,
         kv_caches: &mut [KVCache],
         logits: &mut [f32],
+        gpu: Option<&GpuContext>,
     ) {
         assert_eq!(kv_caches.len(), self.layers.len());
 
@@ -73,7 +76,7 @@ impl Transformer {
 
         let mut layer_output = vec![0.0f32; self.embed_dim];
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward(&hidden, position, rope, &mut kv_caches[i], &mut layer_output);
+            layer.forward(&hidden, position, rope, &mut kv_caches[i], &mut layer_output, gpu);
             if position == 0 && cfg!(debug_assertions) {
                 let hmin = layer_output.iter().cloned().fold(f32::MAX, f32::min);
                 let hmax = layer_output.iter().cloned().fold(f32::MIN, f32::max);
@@ -91,6 +94,6 @@ impl Transformer {
             eprintln!("  [FNL] min={:9.4} max={:9.4} mean={:9.4} h0..3={:.4},{:.4},{:.4},{:.4}",
                 hmin, hmax, mean, hidden[0], hidden[1], hidden[2], hidden[3]);
         }
-        self.lm_head.mat_vec_mul(&hidden, logits);
+        self.lm_head.mat_vec_mul(&hidden, logits, gpu);
     }
 }
