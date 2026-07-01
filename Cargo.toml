@@ -7,3 +7,8 @@ description = "Pure Rust GGUF inference engine - no AI/ML library dependencies"
 [[bin]]
 name = "gguf-infer"
 path = "src/main.rs"
+
+[dependencies]
+wgpu = { version = "22", features = ["webgl"] }
+pollster = "0.3"
+bytemuck = "1"
