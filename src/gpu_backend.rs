@@ -435,51 +435,18 @@ impl GpuContext {
         rows: usize,
         cols: usize,
     ) {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-        static VERIFY_Q4K: AtomicBool = AtomicBool::new(true);
-
         // Q6_K: fall back to CPU (WGSL dequant has GPU execution bug)
         if dtype == GgufDataType::Q6_K {
             return self.fallback_cpu(weight_data, dtype, x, out, rows, cols);
         }
 
         // Normal path for other dtypes (Q4_K, etc.)
-        let should_verify_q4k = match dtype {
-            GgufDataType::Q4_K => VERIFY_Q4K.swap(false, Ordering::Relaxed),
-            _ => false,
-        };
-
         let (pipeline, layout) = match self.get_or_create_pipeline(dtype) {
             Some(p) => p,
             None => return self.fallback_cpu(weight_data, dtype, x, out, rows, cols),
         };
 
-        if should_verify_q4k && rows < 16000 {
-            let mut cpu_out = vec![0.0f32; rows];
-            self.fallback_cpu(weight_data, dtype, x, &mut cpu_out, rows, cols);
-            self.do_mat_vec_mul(weight_data, dtype, x, out, rows, cols, &pipeline, &layout);
-            let mut max_diff = 0.0f32;
-            let mut worst_row = 0;
-            for i in 0..rows {
-                let d = (out[i] - cpu_out[i]).abs();
-                if d > max_diff { max_diff = d; worst_row = i; }
-            }
-            eprintln!("  VERIFY {:?} ({}x{}): max_diff={:.6} worst_row={} gpu={:.4} cpu={:.4}", dtype, rows, cols, max_diff, worst_row, out[worst_row], cpu_out[worst_row]);
-            if max_diff > 0.1 {
-                // Find more mismatches
-                let mut count = 0;
-                for i in 0..rows {
-                    if (out[i] - cpu_out[i]).abs() > 0.5 {
-                        eprintln!("    row {}: gpu={:.4} cpu={:.4}", i, out[i], cpu_out[i]);
-                        count += 1;
-                        if count >= 5 { break; }
-                    }
-                }
-            }
-        } else {
-            self.do_mat_vec_mul(weight_data, dtype, x, out, rows, cols, &pipeline, &layout);
-        }
+        self.do_mat_vec_mul(weight_data, dtype, x, out, rows, cols, &pipeline, &layout)
     }
 
     fn do_mat_vec_mul(

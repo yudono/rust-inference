@@ -155,7 +155,12 @@ impl Model {
 
         // --- Load tensor weights (keep quantized, on-the-fly dequant) ---
         let mut raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
-        let mut tensor_meta: HashMap<String, (GgufDataType, usize, usize)> = HashMap::new(); // name -> (dtype, ne0, ne1)
+        let mut tensor_meta: HashMap<String, (GgufDataType, usize, usize)> = HashMap::new();
+
+        // Single file descriptor for all tensor reads
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("Cannot open model file: {}", e))?;
+        use std::io::{Read, Seek, SeekFrom};
 
         for tensor_info in &gguf.tensors {
             let n_elements = tensor_info.n_elements();
@@ -174,14 +179,18 @@ impl Model {
                 }
             };
             let file_offset = gguf.data_offset + tensor_info.offset;
-            let raw = gg::read_tensor_data(path, file_offset, byte_size)
-                .map_err(|e| format!("Failed to read '{}': {}", tensor_info.name, e))?;
+            let mut buf = vec![0u8; byte_size];
+            file.seek(SeekFrom::Start(file_offset))
+                .map_err(|e| format!("Cannot seek in file: {}", e))?;
+            file.read_exact(&mut buf)
+                .map_err(|e| format!("Cannot read '{}': {}", tensor_info.name, e))?;
 
             let ne0 = tensor_info.dims[0];
             let ne1 = if tensor_info.dims.len() > 1 { tensor_info.dims[1] } else { 1 };
             tensor_meta.insert(tensor_info.name.clone(), (tensor_info.data_type, ne0, ne1));
-            raw_tensors.insert(tensor_info.name.clone(), raw);
+            raw_tensors.insert(tensor_info.name.clone(), buf);
         }
+        // File dropped here (single open instead of N opens)
 
         let head_dim = config.embed_dim / config.n_heads;
 
@@ -514,21 +523,4 @@ fn strip_special_tokens(text: &str) -> String {
     // Also remove trailing < or | that might be partial special token starts
     result = result.trim_end_matches('<').trim_end_matches('|').trim().to_string();
     result
-}
-
-// Helper module for reading tensor data from file
-mod gg {
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
-    use std::path::Path;
-
-    pub fn read_tensor_data(path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
-        let mut file = File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("Cannot seek: {}", e))?;
-        let mut buf = vec![0u8; size];
-        file.read_exact(&mut buf)
-            .map_err(|e| format!("Cannot read: {}", e))?;
-        Ok(buf)
-    }
 }
