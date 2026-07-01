@@ -30,7 +30,258 @@
 //   Layout: [f16 d | uint8 × 8 scales | uint8 × 64 ql | uint8 × 128 qh]
 //   6-bit quantization with 8 sub-blocks.
 
+use std::cmp;
 use crate::gguf::GgufDataType;
+
+// ============================================================================
+// QuantizedMatrix — On-the-fly dequantization + mat-vec
+// ============================================================================
+
+/// A weight matrix stored in quantized format.
+/// Dequantization happens on-the-fly during mat-vec multiplication,
+/// avoiding the ~4x memory overhead of storing full f32.
+#[derive(Debug, Clone)]
+pub struct QuantizedMatrix {
+    pub data: Vec<u8>,   // raw quantized bytes
+    pub dtype: GgufDataType,
+    pub rows: usize,     // out_dim (slow dimension ne1)
+    pub cols: usize,     // in_dim  (fast dimension ne0)
+}
+
+impl QuantizedMatrix {
+    pub fn new(data: Vec<u8>, dtype: GgufDataType, rows: usize, cols: usize) -> Self {
+        QuantizedMatrix { data, dtype, rows, cols }
+    }
+
+    fn block_size(&self) -> usize {
+        match self.dtype {
+            GgufDataType::Q4_0 | GgufDataType::Q8_0 | GgufDataType::Q5_0 => 32,
+            GgufDataType::Q4_K | GgufDataType::Q5_K | GgufDataType::Q6_K => 256,
+            GgufDataType::F32 => 1,
+            GgufDataType::F16 => 1,
+            GgufDataType::Q4_1 | GgufDataType::Q5_1 | GgufDataType::Q8_1 | GgufDataType::Q2_K | GgufDataType::Q3_K => 256,
+        }
+    }
+
+    fn block_bytes(&self) -> usize {
+        match self.dtype {
+            GgufDataType::F32 => 4,
+            GgufDataType::F16 => 2,
+            GgufDataType::Q8_0 => 34,
+            GgufDataType::Q4_0 => 18,
+            GgufDataType::Q5_0 => 22,
+            GgufDataType::Q4_K => 144,
+            GgufDataType::Q5_K => 176,
+            GgufDataType::Q6_K => 210,
+            GgufDataType::Q4_1 | GgufDataType::Q5_1 | GgufDataType::Q8_1 | GgufDataType::Q2_K | GgufDataType::Q3_K => 0,
+        }
+    }
+
+    /// Dequantize one block into buf (buf.len() must be >= block_size).
+    fn dequantize_block(&self, block_idx: usize, buf: &mut [f32]) {
+        let bs = self.block_size();
+        let bb = self.block_bytes();
+        let offset = block_idx * bb;
+        let slice = &self.data[cmp::min(offset, self.data.len())..];
+
+        match self.dtype {
+            GgufDataType::F32 => {
+                for i in 0..bs {
+                    let off = i * 4;
+                    if off + 3 < slice.len() {
+                        let bits = u32::from_le_bytes([slice[off], slice[off+1], slice[off+2], slice[off+3]]);
+                        buf[i] = f32::from_bits(bits);
+                    }
+                }
+            }
+            GgufDataType::F16 => {
+                for i in 0..bs {
+                    let off = i * 2;
+                    if off + 1 < slice.len() {
+                        buf[i] = read_fp16_le(&slice[off..]);
+                    }
+                }
+            }
+            GgufDataType::Q8_0 => {
+                let d = read_fp16_le(slice);
+                for i in 0..bs {
+                    if i < slice.len().saturating_sub(2) {
+                        buf[i] = d * (slice[2 + i] as i8 as f32);
+                    }
+                }
+            }
+            GgufDataType::Q4_0 => {
+                let d = read_fp16_le(slice);
+                for i in 0..bs {
+                    let byte_val = slice[2 + i / 2];
+                    let nibble = if i % 2 == 0 { byte_val & 0x0F } else { (byte_val >> 4) & 0x0F };
+                    buf[i] = d * (nibble as i8 - 8) as f32;
+                }
+            }
+            GgufDataType::Q5_0 => {
+                let d = read_fp16_le(slice);
+                let qh = u32::from_le_bytes([slice[2], slice[3], slice[4], slice[5]]);
+                let qs = &slice[6..];
+                for i in 0..16 {
+                    let xl = qs[i] & 0x0F;
+                    let xh = (((qh >> i) & 1) << 4) as u8;
+                    buf[i] = d * ((xl | xh) as i8 - 16) as f32;
+                }
+                for i in 16..32 {
+                    let xl = qs[i - 16] >> 4;
+                    let xh = (((qh >> i) & 1) << 4) as u8;
+                    buf[i] = d * ((xl | xh) as i8 - 16) as f32;
+                }
+            }
+            GgufDataType::Q4_K => {
+                dequant_q4_k_block(slice, buf);
+            }
+            GgufDataType::Q5_K => {
+                dequant_q5_k_block(slice, buf);
+            }
+            GgufDataType::Q6_K => {
+                dequant_q6_k_block(slice, buf);
+            }
+            GgufDataType::Q4_1 | GgufDataType::Q5_1 | GgufDataType::Q8_1 |
+            GgufDataType::Q2_K | GgufDataType::Q3_K => {} // unsupported, leave zero
+        }
+    }
+
+    /// Dequantize a single row (all cols) into buf.
+    pub fn dequantize_row(&self, row: usize, buf: &mut [f32]) {
+        assert!(row < self.rows);
+        assert!(buf.len() >= self.cols);
+        let bs = self.block_size();
+        let n_blocks_per_row = (self.cols + bs - 1) / bs;
+        let start_block = (row * self.cols) / bs;
+        let col_offset = (row * self.cols) % bs;
+        let mut block_buf = vec![0.0f32; bs];
+
+        for bi in 0..n_blocks_per_row {
+            let block_idx = start_block + bi;
+            if block_idx * bs >= self.rows * self.cols { break; }
+            self.dequantize_block(block_idx, &mut block_buf);
+            let src_start = if bi == 0 { col_offset } else { 0 };
+            let src_end = cmp::min(bs, self.cols + col_offset - bi * bs);
+            for k in src_start..src_end {
+                let actual_dst = if bi == 0 { k - col_offset } else { bi * bs + k };
+                if actual_dst < self.cols {
+                    buf[actual_dst] = block_buf[k];
+                }
+            }
+        }
+    }
+
+    /// Quantized mat-vec-mul-transposed: out[row] = Σ_col W[col, row] * x[col]
+    /// Equivalent to `mat_vec_mul_transposed(f32_data, x, out, rows, cols)`.
+    pub fn mat_vec_mul(&self, x: &[f32], out: &mut [f32]) {
+        assert_eq!(x.len(), self.cols);
+        assert_eq!(out.len(), self.rows);
+        out.fill(0.0);
+
+        let total = self.rows * self.cols;
+        let bs = self.block_size();
+        let n_blocks = (total + bs - 1) / bs;
+        let mut block_buf = vec![0.0f32; bs];
+
+        for b in 0..n_blocks {
+            self.dequantize_block(b, &mut block_buf);
+            let start = b * bs;
+            let end = cmp::min(start + bs, total);
+            for k in 0..(end - start) {
+                let flat = start + k;
+                let col = flat % self.cols;
+                let row = flat / self.cols;
+                out[row] += block_buf[k] * x[col];
+            }
+        }
+    }
+}
+
+/// Block-level Q4_K dequant (slice must start at block boundary)
+fn dequant_q4_k_block(slice: &[u8], buf: &mut [f32]) {
+    let d = read_fp16_le(slice);
+    let dmin = read_fp16_le(&slice[2..]);
+    let scales = &slice[4..16];
+    let qs = &slice[16..144];
+    let mut is = 0;
+    for _j in (0..256).step_by(64) {
+        let (sc0, m0) = get_scale_min_k4(is, scales);
+        let d1 = d * sc0;
+        let m1 = dmin * m0;
+        let (sc1, m1_val) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * sc1;
+        let m2 = dmin * m1_val;
+        let q = &qs[(is / 2) * 32..];
+        for l in 0..32 { buf[is / 2 * 64 + l] = d1 * ((q[l] & 0x0F) as f32) - m1; }
+        for l in 0..32 { buf[is / 2 * 64 + 32 + l] = d2 * (((q[l] >> 4) & 0x0F) as f32) - m2; }
+        is += 2;
+    }
+}
+
+/// Block-level Q5_K dequant
+fn dequant_q5_k_block(slice: &[u8], buf: &mut [f32]) {
+    let d = read_fp16_le(slice);
+    let dmin = read_fp16_le(&slice[2..]);
+    let scales = &slice[4..16];
+    let qh = &slice[16..48];
+    let qs = &slice[48..176];
+    let mut is = 0;
+    let mut u1 = 1u8;
+    let mut u2 = 2u8;
+    for _j in (0..256).step_by(64) {
+        let (sc0, m0) = get_scale_min_k4(is, scales);
+        let d1 = d * sc0;
+        let m1 = dmin * m0;
+        let (sc1, m1_val) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * sc1;
+        let m2 = dmin * m1_val;
+        let ql = &qs[(is / 2) * 32..];
+        for l in 0..32 {
+            let lo = ql[l] & 0x0F;
+            let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+            buf[is / 2 * 64 + l] = d1 * (lo + hi) as f32 - m1;
+        }
+        for l in 0..32 {
+            let lo = ql[l] >> 4;
+            let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+            buf[is / 2 * 64 + 32 + l] = d2 * (lo + hi) as f32 - m2;
+        }
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Block-level Q6_K dequant
+fn dequant_q6_k_block(slice: &[u8], buf: &mut [f32]) {
+    let ql = &slice[0..128];
+    let qh = &slice[128..192];
+    let sc_raw = &slice[192..208];
+    let d = read_fp16_le(&slice[208..210]);
+
+    for n in (0..256).step_by(128) {
+        let iter = n / 128;
+        let ql_iter = &ql[iter * 64..];
+        let qh_iter = &qh[iter * 32..];
+        let sc_iter = &sc_raw[iter * 8..];
+        for l in 0..32usize {
+            let is = l / 16;
+            let q1_val = (ql_iter[l] & 0x0F) as i32 | (((qh_iter[l] as i32) >> 0) & 3) << 4;
+            let q2_val = (ql_iter[l + 32] & 0x0F) as i32 | (((qh_iter[l] as i32) >> 2) & 3) << 4;
+            let q3_val = (ql_iter[l] >> 4) as i32 | (((qh_iter[l] as i32) >> 4) & 3) << 4;
+            let q4_val = (ql_iter[l + 32] >> 4) as i32 | (((qh_iter[l] as i32) >> 6) & 3) << 4;
+            let sc0 = sc_iter[is + 0] as i8 as f32;
+            let sc2 = sc_iter[is + 2] as i8 as f32;
+            let sc4 = sc_iter[is + 4] as i8 as f32;
+            let sc6 = sc_iter[is + 6] as i8 as f32;
+            buf[n + l] = d * sc0 * (q1_val - 32) as f32;
+            buf[n + l + 32] = d * sc2 * (q2_val - 32) as f32;
+            buf[n + l + 64] = d * sc4 * (q3_val - 32) as f32;
+            buf[n + l + 96] = d * sc6 * (q4_val - 32) as f32;
+        }
+    }
+}
 
 // ============================================================================
 // FP16 to FP32 Conversion

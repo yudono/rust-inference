@@ -1,5 +1,6 @@
 use crate::kv_cache::KVCache;
 use crate::math;
+use crate::quant::QuantizedMatrix;
 use crate::rope::RoPE;
 
 #[derive(Debug, Clone)]
@@ -9,10 +10,10 @@ pub struct Attention {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub n_rep: usize,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
+    pub wq: QuantizedMatrix,
+    pub wk: QuantizedMatrix,
+    pub wv: QuantizedMatrix,
+    pub wo: QuantizedMatrix,
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
@@ -24,10 +25,10 @@ impl Attention {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
-        wq: Vec<f32>,
-        wk: Vec<f32>,
-        wv: Vec<f32>,
-        wo: Vec<f32>,
+        wq: QuantizedMatrix,
+        wk: QuantizedMatrix,
+        wv: QuantizedMatrix,
+        wo: QuantizedMatrix,
         bq: Vec<f32>,
         bk: Vec<f32>,
         bv: Vec<f32>,
@@ -57,20 +58,19 @@ impl Attention {
         cache: &mut KVCache,
         output: &mut [f32],
     ) {
-        let embed_dim = x.len();
         let kv_dim = self.n_kv_heads * self.head_dim;
         let q_dim = self.n_heads * self.head_dim;
 
         let mut q = vec![0.0f32; q_dim];
-        math::mat_vec_mul_transposed(&self.wq, x, &mut q, q_dim, embed_dim);
+        self.wq.mat_vec_mul(x, &mut q);
         math::vec_add_inplace(&mut q, &self.bq);
 
         let mut k = vec![0.0f32; kv_dim];
-        math::mat_vec_mul_transposed(&self.wk, x, &mut k, kv_dim, embed_dim);
+        self.wk.mat_vec_mul(x, &mut k);
         math::vec_add_inplace(&mut k, &self.bk);
 
         let mut v = vec![0.0f32; kv_dim];
-        math::mat_vec_mul_transposed(&self.wv, x, &mut v, kv_dim, embed_dim);
+        self.wv.mat_vec_mul(x, &mut v);
         math::vec_add_inplace(&mut v, &self.bv);
 
         for h in 0..self.n_heads {
@@ -118,7 +118,7 @@ impl Attention {
             }
         }
 
-        math::mat_vec_mul_transposed(&self.wo, &attn_output, output, embed_dim, q_dim);
+        self.wo.mat_vec_mul(&attn_output, output);
     }
 
     pub fn n_rep(&self) -> usize {

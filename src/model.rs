@@ -18,7 +18,7 @@ use crate::attention::Attention;
 use crate::gguf::{GgufFile, GgufDataType, MetadataValue};
 use crate::kv_cache::KVCache;
 use crate::mlp::Mlp;
-use crate::quant;
+use crate::quant::QuantizedMatrix;
 use crate::rmsnorm::RmsNorm;
 use crate::rope::RoPE;
 use crate::sampler::{Sampler, SamplerConfig};
@@ -146,179 +146,142 @@ impl Model {
         let head_dim = config.embed_dim / config.n_heads;
         let rope = RoPE::new(head_dim, config.rope_base, config.max_seq_len);
 
-        // --- Load tensor weights ---
-        let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+        // --- Load tensor weights (keep quantized, on-the-fly dequant) ---
+        let mut raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut tensor_meta: HashMap<String, (GgufDataType, usize, usize)> = HashMap::new(); // name -> (dtype, ne0, ne1)
 
         for tensor_info in &gguf.tensors {
             let n_elements = tensor_info.n_elements();
             let byte_size = match tensor_info.data_type {
                 GgufDataType::F32 => n_elements * 4,
                 GgufDataType::F16 => n_elements * 2,
-                GgufDataType::Q4_0 => {
-                    let n_blocks = (n_elements + 31) / 32;
-                    n_blocks * 18
-                }
-                GgufDataType::Q4_K => {
-                    let n_blocks = (n_elements + 255) / 256;
-                    n_blocks * 144
-                }
-                GgufDataType::Q5_K => {
-                    let n_blocks = (n_elements + 255) / 256;
-                    n_blocks * 176
-                }
-                GgufDataType::Q5_0 => {
-                    let n_blocks = (n_elements + 31) / 32;
-                    n_blocks * 22
-                }
-                GgufDataType::Q6_K => {
-                    let n_blocks = (n_elements + 255) / 256;
-                    n_blocks * 210
-                }
-                GgufDataType::Q8_0 => {
-                    let n_blocks = (n_elements + 31) / 32;
-                    n_blocks * 34
-                }
+                GgufDataType::Q4_0 => (n_elements + 31) / 32 * 18,
+                GgufDataType::Q4_K => (n_elements + 255) / 256 * 144,
+                GgufDataType::Q5_K => (n_elements + 255) / 256 * 176,
+                GgufDataType::Q5_0 => (n_elements + 31) / 32 * 22,
+                GgufDataType::Q6_K => (n_elements + 255) / 256 * 210,
+                GgufDataType::Q8_0 => (n_elements + 31) / 32 * 34,
                 _ => {
-                    eprintln!(
-                        "  WARNING: Unsupported type {:?} for tensor '{}', skipping",
-                        tensor_info.data_type, tensor_info.name
-                    );
+                    eprintln!("WARNING: Unsupported type {:?} for '{}', skipping", tensor_info.data_type, tensor_info.name);
                     continue;
                 }
             };
-
             let file_offset = gguf.data_offset + tensor_info.offset;
+            let raw = gg::read_tensor_data(path, file_offset, byte_size)
+                .map_err(|e| format!("Failed to read '{}': {}", tensor_info.name, e))?;
 
-            // Read raw bytes from file
-            let raw_data = gg::read_tensor_data(path, file_offset, byte_size)
-                .map_err(|e| format!("Failed to read tensor '{}': {}", tensor_info.name, e))?;
-
-            // Dequantize to f32
-            let f32_data =
-                quant::dequantize(&raw_data, tensor_info.data_type, n_elements)
-                    .map_err(|e| format!("Failed to dequantize '{}': {}", tensor_info.name, e))?;
-
-            tensors.insert(tensor_info.name.clone(), f32_data);
+            let ne0 = tensor_info.dims[0];
+            let ne1 = if tensor_info.dims.len() > 1 { tensor_info.dims[1] } else { 1 };
+            tensor_meta.insert(tensor_info.name.clone(), (tensor_info.data_type, ne0, ne1));
+            raw_tensors.insert(tensor_info.name.clone(), raw);
         }
 
-        // --- Build transformer model ---
         let head_dim = config.embed_dim / config.n_heads;
 
-        // Load token embeddings
-        let token_embd = tensors
-            .remove("token_embd.weight")
-            .ok_or("Missing token_embd.weight")?;
+        macro_rules! load_mat {
+            ($name:expr, $rows:expr, $cols:expr) => {{
+                let raw = raw_tensors.remove($name).ok_or_else(|| format!("Missing {}", $name))?;
+                let dtype = tensor_meta.get($name).ok_or_else(|| format!("No meta for {}", $name))?.0;
+                QuantizedMatrix::new(raw, dtype, $rows, $cols)
+            }};
+        }
 
+        let token_embd = load_mat!("token_embd.weight", config.vocab_size, config.embed_dim);
 
-        // Load final norm
-        let final_norm_weight = tensors
-            .remove("output_norm.weight")
+        let final_norm_weight = raw_tensors.remove("output_norm.weight")
+            .and_then(|raw| tensor_meta.get("output_norm.weight").map(|(dt, ne0, _ne1)| {
+                let n = *ne0;
+                let mut v = vec![0.0f32; n];
+                if *dt == GgufDataType::F32 {
+                    for i in 0..n {
+                        v[i] = f32::from_le_bytes([raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]]);
+                    }
+                }
+                v
+            }))
             .ok_or("Missing output_norm.weight")?;
         let final_norm = RmsNorm::new(final_norm_weight, config.norm_eps);
 
-        // Load LM head (may be tied with token embeddings)
-        let lm_head = if let Some(w) = tensors.remove("output.weight") {
-            w
+        let lm_head = if let Some(raw) = raw_tensors.remove("output.weight") {
+            let (dt, ne0, ne1) = *tensor_meta.get("output.weight").ok_or("No meta for output.weight")?;
+            QuantizedMatrix::new(raw, dt, ne1, ne0)
         } else {
             token_embd.clone()
         };
 
-
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-
-            let norm_w = tensors
-                .remove(&format!("blk.{}.attn_norm.weight", i))
+            let norm_w = raw_tensors.remove(&format!("blk.{}.attn_norm.weight", i))
+                .and_then(|raw| tensor_meta.get(&format!("blk.{}.attn_norm.weight", i)).map(|(dt, ne0, _ne1)| {
+                    let n = *ne0;
+                    let mut v = vec![0.0f32; n];
+                    if *dt == GgufDataType::F32 {
+                        for j in 0..n {
+                            v[j] = f32::from_le_bytes([raw[j*4], raw[j*4+1], raw[j*4+2], raw[j*4+3]]);
+                        }
+                    }
+                    v
+                }))
                 .ok_or_else(|| format!("Missing blk.{}.attn_norm.weight", i))?;
             let attention_norm = RmsNorm::new(norm_w, config.norm_eps);
 
-            let wq = tensors
-                .remove(&format!("blk.{}.attn_q.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_q.weight", i))?;
-            let wk = tensors
-                .remove(&format!("blk.{}.attn_k.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_k.weight", i))?;
-            let wv = tensors
-                .remove(&format!("blk.{}.attn_v.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_v.weight", i))?;
-            let wo = tensors
-                .remove(&format!("blk.{}.attn_output.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_output.weight", i))?;
-            let bq = tensors
-                .remove(&format!("blk.{}.attn_q.bias", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_q.bias", i))?;
-            let bk = tensors
-                .remove(&format!("blk.{}.attn_k.bias", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_k.bias", i))?;
-            let bv = tensors
-                .remove(&format!("blk.{}.attn_v.bias", i))
-                .ok_or_else(|| format!("Missing blk.{}.attn_v.bias", i))?;
+            let q_dim = config.n_heads * head_dim;
+            let kv_dim = config.n_kv_heads * head_dim;
+            let wq = load_mat!(&format!("blk.{}.attn_q.weight", i), q_dim, config.embed_dim);
+            let wk = load_mat!(&format!("blk.{}.attn_k.weight", i), kv_dim, config.embed_dim);
+            let wv = load_mat!(&format!("blk.{}.attn_v.weight", i), kv_dim, config.embed_dim);
+            let wo = load_mat!(&format!("blk.{}.attn_output.weight", i), config.embed_dim, q_dim);
 
-            let attention = Attention::new(
-                i,
-                config.n_heads,
-                config.n_kv_heads,
-                head_dim,
-                wq,
-                wk,
-                wv,
-                wo,
-                bq,
-                bk,
-                bv,
-            );
+            let bq = raw_tensors.remove(&format!("blk.{}.attn_q.bias", i))
+                .and_then(|raw| tensor_meta.get(&format!("blk.{}.attn_q.bias", i)).map(|(dt, ne0, _ne1)| {
+                    let n = *ne0;
+                    let mut v = vec![0.0f32; n];
+                    if *dt == GgufDataType::F32 {
+                        for j in 0..n { v[j] = f32::from_le_bytes([raw[j*4], raw[j*4+1], raw[j*4+2], raw[j*4+3]]); }
+                    }
+                    v
+                }))
+                .unwrap_or_else(|| vec![0.0f32; q_dim]);
+            let bk = raw_tensors.remove(&format!("blk.{}.attn_k.bias", i))
+                .and_then(|raw| tensor_meta.get(&format!("blk.{}.attn_k.bias", i)).map(|(dt, ne0, _ne1)| {
+                    let n = *ne0;
+                    let mut v = vec![0.0f32; n];
+                    if *dt == GgufDataType::F32 {
+                        for j in 0..n { v[j] = f32::from_le_bytes([raw[j*4], raw[j*4+1], raw[j*4+2], raw[j*4+3]]); }
+                    }
+                    v
+                }))
+                .unwrap_or_else(|| vec![0.0f32; kv_dim]);
+            let bv = raw_tensors.remove(&format!("blk.{}.attn_v.bias", i))
+                .and_then(|raw| tensor_meta.get(&format!("blk.{}.attn_v.bias", i)).map(|(dt, ne0, _ne1)| {
+                    let n = *ne0;
+                    let mut v = vec![0.0f32; n];
+                    if *dt == GgufDataType::F32 {
+                        for j in 0..n { v[j] = f32::from_le_bytes([raw[j*4], raw[j*4+1], raw[j*4+2], raw[j*4+3]]); }
+                    }
+                    v
+                }))
+                .unwrap_or_else(|| vec![0.0f32; kv_dim]);
 
-            let ffn_norm_w = tensors
-                .remove(&format!("blk.{}.ffn_norm.weight", i))
+            let attention = Attention::new(i, config.n_heads, config.n_kv_heads, head_dim, wq, wk, wv, wo, bq, bk, bv);
+
+            let ffn_norm_w = raw_tensors.remove(&format!("blk.{}.ffn_norm.weight", i))
+                .and_then(|raw| tensor_meta.get(&format!("blk.{}.ffn_norm.weight", i)).map(|(dt, ne0, _ne1)| {
+                    let n = *ne0;
+                    let mut v = vec![0.0f32; n];
+                    if *dt == GgufDataType::F32 {
+                        for j in 0..n { v[j] = f32::from_le_bytes([raw[j*4], raw[j*4+1], raw[j*4+2], raw[j*4+3]]); }
+                    }
+                    v
+                }))
                 .ok_or_else(|| format!("Missing blk.{}.ffn_norm.weight", i))?;
             let ffn_norm = RmsNorm::new(ffn_norm_w, config.norm_eps);
 
-            let gate_proj = tensors
-                .remove(&format!("blk.{}.ffn_gate.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_gate.weight", i))?;
-            let up_proj = tensors
-                .remove(&format!("blk.{}.ffn_up.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_up.weight", i))?;
-            let down_proj = tensors
-                .remove(&format!("blk.{}.ffn_down.weight", i))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_down.weight", i))?;
-            
-            // Verify tensor dimensions
-            let expected_gate = config.hidden_dim * config.embed_dim;
-            let expected_down = config.embed_dim * config.hidden_dim;
-            if gate_proj.len() != expected_gate {
-                eprintln!("  WARNING: blk.{}.ffn_gate.weight: expected {} elements, got {}", i, expected_gate, gate_proj.len());
-            }
-            if up_proj.len() != expected_gate {
-                eprintln!("  WARNING: blk.{}.ffn_up.weight: expected {} elements, got {}", i, expected_gate, up_proj.len());
-            }
-            if down_proj.len() != expected_down {
-                eprintln!("  WARNING: blk.{}.ffn_down.weight: expected {} elements, got {}", i, expected_down, down_proj.len());
-            }
-            
-            // Check for NaN/Inf in gate_proj and up_proj for all layers
-            let gate_w = &gate_proj;
-            let has_nan = gate_w.iter().any(|&v| v.is_nan());
-            let has_inf = gate_w.iter().any(|&v| v.is_infinite());
-            if has_nan || has_inf {
-                eprintln!("  ERROR: blk.{}.ffn_gate.weight has NaN or Inf!", i);
-            }
-            let up_w = &up_proj;
-            let has_nan = up_w.iter().any(|&v| v.is_nan());
-            let has_inf = up_w.iter().any(|&v| v.is_infinite());
-            if has_nan || has_inf {
-                eprintln!("  ERROR: blk.{}.ffn_up.weight has NaN or Inf!", i);
-            }
+            let gate_proj = load_mat!(&format!("blk.{}.ffn_gate.weight", i), config.hidden_dim, config.embed_dim);
+            let up_proj = load_mat!(&format!("blk.{}.ffn_up.weight", i), config.hidden_dim, config.embed_dim);
+            let down_proj = load_mat!(&format!("blk.{}.ffn_down.weight", i), config.embed_dim, config.hidden_dim);
 
             let mlp = Mlp::new(gate_proj, up_proj, down_proj, config.hidden_dim, config.embed_dim);
-
-            if cfg!(debug_assertions) {
-                let w = &mlp.down_proj;
-                let min = w.iter().cloned().fold(f32::MAX, f32::min);
-                let max = w.iter().cloned().fold(f32::MIN, f32::max);
-                let mean = w.iter().sum::<f32>() / w.len() as f32;
-                eprintln!("  blk.{}.ffn_down: min={:+.4} max={:+.4} mean={:+.6}", i, min, max, mean);
-            }
 
             layers.push(TransformerLayer {
                 layer_idx: i,

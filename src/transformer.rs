@@ -2,6 +2,7 @@ use crate::attention::Attention;
 use crate::kv_cache::KVCache;
 use crate::math;
 use crate::mlp::Mlp;
+use crate::quant::QuantizedMatrix;
 use crate::rmsnorm::RmsNorm;
 use crate::rope::RoPE;
 
@@ -47,12 +48,12 @@ impl TransformerLayer {
 
 #[derive(Debug, Clone)]
 pub struct Transformer {
-    pub token_embd: Vec<f32>,
+    pub token_embd: QuantizedMatrix,
     pub embed_dim: usize,
     pub vocab_size: usize,
     pub layers: Vec<TransformerLayer>,
     pub final_norm: RmsNorm,
-    pub lm_head: Vec<f32>,
+    pub lm_head: QuantizedMatrix,
     pub max_seq_len: usize,
 }
 
@@ -68,9 +69,7 @@ impl Transformer {
         assert_eq!(kv_caches.len(), self.layers.len());
 
         let mut hidden = vec![0.0f32; self.embed_dim];
-        for dim in 0..self.embed_dim {
-            hidden[dim] = self.token_embd[self.embed_dim * token_id + dim];
-        }
+        self.token_embd.dequantize_row(token_id, &mut hidden);
 
         let mut layer_output = vec![0.0f32; self.embed_dim];
         for (i, layer) in self.layers.iter().enumerate() {
@@ -92,6 +91,6 @@ impl Transformer {
             eprintln!("  [FNL] min={:9.4} max={:9.4} mean={:9.4} h0..3={:.4},{:.4},{:.4},{:.4}",
                 hmin, hmax, mean, hidden[0], hidden[1], hidden[2], hidden[3]);
         }
-        math::mat_vec_mul_transposed(&self.lm_head, &hidden, logits, self.vocab_size, self.embed_dim);
+        self.lm_head.mat_vec_mul(&hidden, logits);
     }
 }
